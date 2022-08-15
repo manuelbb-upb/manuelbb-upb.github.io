@@ -20,6 +20,14 @@ using Logging
 # ╔═╡ 24a47883-c281-4aa1-859f-714a3788a2d3
 using Parameters: @unpack
 
+# ╔═╡ 75485480-67dc-4247-a54a-79eda52207ba
+begin 
+	import ForwardDiff
+	using Preferences
+	set_preferences!(ForwardDiff, "nansafe_mode" => true)
+	const AD = ForwardDiff
+end
+
 # ╔═╡ e51f949d-6483-45aa-a18a-95d8245b63aa
 using Dictionaries# for sorted Dictionaries
 
@@ -35,17 +43,20 @@ using OSQP
 # ╔═╡ d4a90042-f522-42ff-8260-7965591278c0
 md"# Preparations"
 
+# ╔═╡ f0d4763d-2195-402e-aeef-464f0a1c5c68
+md"## Imports"
+
 # ╔═╡ 2995a784-a402-4c08-9bed-bd6c7d5fdfae
 import LinearAlgebra: norm, qr, givens, Hermitian, inv, cholesky
 
 # ╔═╡ b80eec63-10aa-4e77-a657-e0e12239dc15
 import LinearAlgebra.I as eye
 
-# ╔═╡ 52499a91-400b-4371-a7a1-d6d924579c48
-import ForwardDiff as AD
-
 # ╔═╡ 3c5381fb-0944-4b92-9837-5dddfe4bce11
 import FiniteDiff as FD
+
+# ╔═╡ 489c7a4c-7557-47f9-a1e0-7fc420765766
+md"## Colors"
 
 # ╔═╡ a40db56a-8466-4aa1-95d5-7560e663098a
 begin
@@ -661,6 +672,16 @@ function compute_normal_step(mop, iterate, mod_objectives, mod_eq_constraints, m
 	@objective(itrn, Min, sum(n.^2))
 
 	x_n = x .+ n
+	for i in 1:num_vars(mop)
+		# somehow, JuMP does not like Inf bounds here...
+		if !isinf(mop.lb[i])
+			@constraint(itrn, mop.lb[i] <= x_n[i])
+		end
+		if !isinf(mop.ub[i])
+			@constraint(itrn, x_n[i] <= mop.ub[i])
+		end
+	end
+	
 	@constraint(itrn, mop.A_eq * x_n .== mop.b_eq)
 	@constraint(itrn, mop.A_ineq * x_n .<= mop.b_ineq)
 
@@ -732,6 +753,16 @@ function compute_descent_step(mop, algo_config, iterate, n, mod_objectives, mod_
 
 	s = n .+ d
 	x_s = x .+ s
+	for i in 1:num_vars(mop)
+		# somehow, JuMP does not like Inf bounds here...
+		if !isinf(mop.lb[i])
+			@constraint(itrt, mop.lb[i] <= x_s[i])
+		end
+		if !isinf(mop.ub[i])
+			@constraint(itrt, x_s[i] <= mop.ub[i])
+		end
+	end
+	
 	@constraint(itrt, mop.A_eq * x_s .== mop.b_eq)
 	@constraint(itrt, mop.A_ineq * x_s .<= mop.b_ineq)
 
@@ -847,6 +878,7 @@ function stepsize_interval(
 	::Type{T} = Base.promote_type(Float16,X,D,B)
 ) :: Union{Tuple{T,T},Nothing} where {X<:Real, D<:Real, B<:Real, T}
 	T_Inf = T(Inf)
+	T_NaN = T(NaN)
 	l = -T_Inf
 	r = T_Inf
 	for (xi, di, bi) = zip(x,d,b)
@@ -855,7 +887,7 @@ function stepsize_interval(
 		l = max( l, li )
 		r = min( r, ri )
 		if l > r
-			return nothing
+			return (T_NaN, T_NaN)
 		end
 	end
 	return (l, r)
@@ -1156,6 +1188,56 @@ function build_models(cfg::RbfConfig, mop, algo_config, database, iterate, Δ)
 	return mod_o, mod_e, mod_i
 end
 
+# ╔═╡ 32171032-85fc-47b4-8e94-9673422c7534
+function intersect_linear_constraints_jump( 
+	x :: AbstractVector{X}, 
+	d :: AbstractVector{D}, 
+	lb :: AbstractVector{LB} = Float32[], 
+	ub :: AbstractVector{UB} = Float32[], 
+	A_ineq :: AbstractMatrix{AINEQ} = Matrix{Float32}(undef, 0, length(x)), 
+	b_ineq :: AbstractVector{BINEQ} = Float32[],
+	A_eq :: AbstractMatrix{AEQ} = Matrix{Float32}(undef, 0, length(x)), 
+	b_eq :: AbstractVector{BEQ} = Float32[], 
+) where {X <: Real,D<:Real,LB<:Real,UB<:Real,AEQ<:Real,BEQ<:Real,AINEQ<:Real,BINEQ<:Real}
+	
+	prob = JuMP.Model( QP_OPTIMIZER )
+	JuMP.set_silent(prob)
+	#JuMP.set_optimizer_attribute(itrt, "polish", true)
+
+	@variable(prob, σ_min)
+	
+	@objective(prob, Min, σ_min)
+
+	x_s = x .+ σ_min.*d
+	@constraint(prob, lb .<= x_s)
+	@constraint(prob, x_s .<= ub)
+	@constraint(prob, A_eq * x_s .== b_eq)
+	@constraint(prob, A_ineq * x_s .<= b_ineq)	
+	optimize!(prob)
+
+	prob = JuMP.Model( QP_OPTIMIZER )
+	JuMP.set_silent(prob)
+
+	@variable(prob, σ_max)
+	
+	@objective(prob, Max, σ_max)
+
+	x_s = x .+ σ_max.*d
+	@constraint(prob, lb .<= x_s)
+	@constraint(prob, x_s .<= ub)
+	@constraint(prob, A_eq * x_s .== b_eq)
+	@constraint(prob, A_ineq * x_s .<= b_ineq)
+	
+	optimize!(prob)
+
+	_s_min = value(σ_min)
+	_s_max = value(σ_max)
+	if any(isnan(_s_min)) || isnan(_s_max)
+		return NaN, NaN
+	end
+	return _s_min, _s_max
+end
+
 # ╔═╡ 529f9f7f-9a66-4020-aa8b-0d3e63372229
 md"##### Armijo-like Backtracking"
 
@@ -1182,48 +1264,54 @@ function backtrack( mop, algo_config, iterate, Δ, n, d, χ, mod_objectives, mod
 	# determine initial stepsize for normed direction `d/norm_d`
 	s = n .+ d
 	norm_s = norm(s, Inf)
-	σ_init = if norm_s == Δ
+	if norm_s == Δ
 		# ``x + s`` lies on the boundary of trust region
-		1
+		σ_init = 1.0
 	elseif norm_s < Δ
 		if norm_d < 1
 			# global constraints are binding, we cannot scale `d` up
-			1
+			σ_init = 1.0
 		else
+			# scale `d` with a factor >= 1...
 			# use same constraints as in descent step calculation.
-			# `intersect_linear_constraints` expects "Ax <= b".
+			# `intersect_linear_constraints` expects "A(x_n+σd) <= b".
 			# `mop` provides linear constraints in that form
-			# models provide "h(x) + H(x)*s ≦ 0" ⇔ "Hs <= -h"
+			# models provide "h(x) + H(x)*(x_n + σd - x) <= 0"
+			# ⇔ "H(x_n +σd) <= -h(x) + Hx
+	
+			H = AD.jacobian( mod_eq_constraints,  x)
 			A_eq = Matrix{Float64}([
 				mop.A_eq;
-				AD.jacobian( mod_eq_constraints,  x)
+				H
 			])
 			b_eq = Vector{Float64}([
 				mop.b_eq;
-				-mod_eq_constraints(x)
+				H * x - mod_eq_constraints(x)
 			])
+	
+			G = AD.jacobian( mod_ineq_constraints,  x)
 			A_ineq = Matrix{Float64}([
 				mop.A_ineq;
-				AD.jacobian( mod_ineq_constraints,  x)
+				G
 			])
 			b_ineq = Vector{Float64}([
 				mop.b_ineq;
-				-mod_ineq_constraints(x)
+				G * x - mod_ineq_constraints(x)
 			])
 			lb = max.( mop.lb, x .- Δ )
 			ub = min.( mop.ub, x .+ Δ )
 			stepsizes = intersect_linear_constraints(x_n, d, lb, ub, A_ineq, b_ineq, A_eq, b_eq)
 			_σ_init = maximum(stepsizes)
 			if isnan(_σ_init) || _σ_init < 0
-				0
+				σ_init = 0.0
 			else
-				_σ_init
+				σ_init = _σ_init
 			end
 		end
 	elseif norm_s > Δ
-		max(0, (Δ - norm(n,Inf))/norm_d ) 	# TODO Think about this
+		σ_init = max(0, (Δ - norm(n,Inf))/norm_d ) 	# TODO Think about this
 	end
-
+	
 	a = algo_config.armijo_rhs_factor
 	b = algo_config.armijo_backtrack_factor
 	σ_min = algo_config.armijo_min_stepsize 
@@ -1968,6 +2056,9 @@ function plot_two_parabola_iterations_c(
 	end
 end
 
+# ╔═╡ ab2a2d89-697f-4602-80f3-b8b8f9dca037
+md"#### Non-Convex"
+
 # ╔═╡ a6694cc3-e587-45ff-a8e2-c0ab946df074
 md"""
 ## Footnotes
@@ -2013,33 +2104,36 @@ function _optimize(
 	n = fill(NaN, num_vars(mop))
 	d = copy(n)
 	it_stat = INITIALIZATION
-
-	if logging_callback isa Function
-		logging_callback(; 
-			iter_index = 0,
-			current_iterate = iterate,
-			radius = Δ,
-			trial_iterate = iterate_t,
-			normal_step = n,
-			descent_step = d,
-			criticality = Inf,
-			iter_status = it_stat,
-		)
-	end
+	χ = Inf
 
 	# Iterate
-	k = 1
+	k = 0
+	ret_code = BUDGET
 	while true
 
 		if k >= algo_config.max_iter
+			ret_code = BUDGET
 			break
+		end
+		if logging_callback isa Function
+			logging_callback(; 
+				iter_index = k,
+				current_iterate = iterate,
+				radius = Δ,
+				trial_iterate = iterate_t,
+				normal_step = n,
+				descent_step = d,
+				criticality = χ,
+				iter_status = it_stat,
+			)
 		end
 				
 		@unpack x, fx, hx, gx, res_eq, res_ineq, θ = iterate
 		χ = Inf
 
 		if Δ <= algo_config.stop_delta_min
-			return iterate, TOLERANCE_X, k, filter, database
+			ret_code = TOLERANCE_X
+			break
 		end
 		
 		@info """
@@ -2105,28 +2199,14 @@ function _optimize(
 			
 			if !succ_ret
 				### could not find restoration step, return unsuccessful
-				return iterate, INFEASIBLE, k, filter, database
+				ret_code = INFEASIBLE
+				break
 			end
 			@info "Found restoration step $(vec2str(d))"
 			## update variables for next iteration
 			iterate_t = make_result(x .+ d, mop)
 			push!(database, iterate_t)
-			_it_stat = RESTORATION
-
-			if logging_callback isa Function
-				logging_callback(; 
-					iter_index = k,
-					radius = Δ,
-					current_iterate = iterate,
-					trial_iterate = iterate_t,
-					normal_step = n,
-					descent_step = d,
-					criticality = χ,
-					iter_status = _it_stat,
-				)
-			end
-			
-			it_stat = _it_stat
+			it_stat = RESTORATION
 			iterate = iterate_t
 			Δ = _Δ
 
@@ -2139,7 +2219,7 @@ function _optimize(
 
 			@info "Criticality is $(χ) and descent step is $(vec2str(d))"
 
-			if χ <= algo_config.stop_crit_tol_abs && θ <= algo_config.stop_theta_tol_abs
+			if abs(χ) <= algo_config.stop_crit_tol_abs && θ <= algo_config.stop_theta_tol_abs
 				return iterate, CRITICAL, k, filter, database
 			end
 
@@ -2157,7 +2237,7 @@ function _optimize(
 			@info "Trying a descent step with stepsize $(σ) along $(vec2str(d))" 
 
 			# evaluate trial point 
-			x_t = x .+ n .+ σ .* d
+			x_t = min.(max.(mop.lb, x .+ n .+ σ .* d), mop.ub)
 			iterate_t = make_result( x_t, mop )
 			push!(database, iterate_t)
 			fx_t, θ_t = iterate_t.fx, iterate_t.θ
@@ -2210,23 +2290,9 @@ function _optimize(
 				end
 			end
 		
-			if logging_callback isa Function
-				logging_callback(; 
-					iter_index = k,
-					radius = Δ,
-					current_iterate = iterate,
-					trial_iterate = iterate_t,
-					normal_step = n,
-					descent_step = d,
-					criticality = χ,
-					iter_status = _it_stat,
-				)
-			end
-
 			@info "Iteration status: $(_it_stat)."
 			Δ = _Δ
 			it_stat = _it_stat
-			k += 1
 			
 			if Int(it_stat) > 0
 				@info "The trial point is accepted!"
@@ -2241,23 +2307,40 @@ function _optimize(
 					change_x <= algo_config.stop_xtol_abs || 
 					change_x <= algo_config.stop_xtol_rel * norm_x 
 				)
-					return iterate, TOLERANCE_X, k, filter, database
+					ret_code = TOLERANCE_X
+					break
 				end
 				if (
 					change_f <= algo_config.stop_ftol_abs || 
 					change_f <= algo_config.stop_ftol_rel * norm_f
 				)
-					return iterate, TOLERANCE_F, k, filter, database
+					ret_code = TOLERANCE_F
 				end
 			end
 		end
 	
 		if crit_stat == MAX_LOOP_EXIT || crit_stat == CRITICAL_EXIT
-			return iterate, CRITICAL, k, filter, database
+			ret_code = CRITICAL
+			break
 		elseif crit_stat == TOLERANCE_X_EXIT
-			return iterate, TOLERANCE_X, k, filter, database
+			ret_code = TOLERANCE_X
+			break
 		end
+		k += 1
 	end
+	if logging_callback isa Function
+		logging_callback(; 
+			iter_index = k+1,
+			current_iterate = iterate,
+			radius = Δ,
+			trial_iterate = iterate_t,
+			normal_step = n,
+			descent_step = d,
+			criticality = χ,
+			iter_status = it_stat,
+		)
+	end
+	
 	return iterate, BUDGET, k, filter, database
 end
 
@@ -2411,6 +2494,54 @@ res_two_parabola_3 = do_experiment(
 # ╔═╡ b7e7bb1e-b73d-4b9e-b7e6-4763f1d4bbbb
 plot_two_parabola_iterations_c(res_two_parabola_3...)
 
+# ╔═╡ a88c87c3-9277-41fe-9208-d4af8496d51e
+begin
+	g = x -> 1 + 10*x[2]
+	h = x -> 1 - (x[1]/g(x))^2 - (x[1]/g(x))*sin(8*π*x[1])
+	f1 = x -> x[1]
+	f2 = x -> g(x)*h(x)
+	mop = MOP(;
+		num_vars = 2,
+		lb = zeros(2),
+		ub = ones(2),
+		objectives = [ f1, f2 ]
+	)
+	x0 = [0.2114348534, 0.7920775903]
+	
+	mop, model_config, x0, fin_res, ret, info_dict = do_experiment(mop, x0; model_config = RbfConfig(), algo_config=AlgorithmConfig(;delta_init=0.1))
+
+	theme = Theme(
+		Scatter = (
+			markersize = 4,
+			strokewidth = 0,
+		),
+	)
+
+	@show fin_res
+	with_theme(theme) do
+		# setup figure
+		fig = Figure(resolution=(720,480))
+		ax1 = Axis(fig[1,1])
+		ax2 = Axis(fig[1,2])
+		# filled contour of objective
+		XX = LinRange( mop.lb[1], mop.ub[1], 50)
+		YY = LinRange( mop.lb[2], mop.ub[2], 50)
+		xs = [(x,y) for x=XX, y=YY][:]
+
+		c = range(CYAN, ORANGE, length(xs))
+		scatter!(ax1, xs; color = c)
+		scatter!(ax1, [(id.result.x[1], id.result.x[2]) for id = info_dict]; markersize = 10)
+		lines!(ax1, [(id.result.x[1], id.result.x[2]) for id = info_dict])
+
+		scatter!(ax2, [(f1(x), f2(x)) for x = xs]; color = c)
+		scatter!(ax2, [(id.result.fx[1], id.result.fx[2]) for id = info_dict]; markersize = 10)
+		lines!(ax2, [(id.result.fx[1], id.result.fx[2]) for id = info_dict])
+
+		Label(fig[0,:], "Deb's Test Problem")
+		fig
+	end
+end
+
 # ╔═╡ 63980505-a6a0-455f-82b2-cc2cfd321670
 # ╠═╡ disabled = true
 #=╠═╡
@@ -2493,6 +2624,7 @@ NLopt = "76087f3c-5699-56af-9a33-bf431cd00edd"
 OSQP = "ab2f91bb-94b4-55e3-9ba0-7f65df51de79"
 Parameters = "d96e819e-fc66-5662-9728-84c9c7592b0a"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 RadialBasisFunctionModels = "48790e7e-73b2-491a-afa5-62818081adcb"
 
 [compat]
@@ -2506,6 +2638,7 @@ NLopt = "~0.6.5"
 OSQP = "~0.8.0"
 Parameters = "~0.12.3"
 PlutoUI = "~0.7.39"
+Preferences = "~1.3.0"
 RadialBasisFunctionModels = "~0.3.4"
 """
 
@@ -3937,14 +4070,16 @@ version = "3.5.0+0"
 # ╔═╡ Cell order:
 # ╟─d4a90042-f522-42ff-8260-7965591278c0
 # ╠═6f66fc66-4066-490e-abd7-8ebb2a605bdb
+# ╟─f0d4763d-2195-402e-aeef-464f0a1c5c68
 # ╠═85be4fe0-8dc3-43af-83a4-48bfc0c24628
 # ╠═7d7ec467-3c22-4c8a-9ea1-a10e1ee0179b
 # ╠═24a47883-c281-4aa1-859f-714a3788a2d3
 # ╠═2995a784-a402-4c08-9bed-bd6c7d5fdfae
 # ╠═b80eec63-10aa-4e77-a657-e0e12239dc15
-# ╠═52499a91-400b-4371-a7a1-d6d924579c48
+# ╠═75485480-67dc-4247-a54a-79eda52207ba
 # ╠═3c5381fb-0944-4b92-9837-5dddfe4bce11
 # ╠═e51f949d-6483-45aa-a18a-95d8245b63aa
+# ╟─489c7a4c-7557-47f9-a1e0-7fc420765766
 # ╠═a40db56a-8466-4aa1-95d5-7560e663098a
 # ╟─68ada2bc-17e0-11ed-3f7b-414dc56ffd57
 # ╟─335a2cca-8f5f-46ce-af9d-e28a3b361986
@@ -4020,6 +4155,7 @@ version = "3.5.0+0"
 # ╟─690aee10-045c-49cc-bd98-5bfc3206a9a5
 # ╟─f81657c9-09c0-4689-a2ed-783858349416
 # ╟─e1f0ad5f-a601-48af-906c-2190b4c1bd2f
+# ╟─32171032-85fc-47b4-8e94-9673422c7534
 # ╟─529f9f7f-9a66-4020-aa8b-0d3e63372229
 # ╠═8ec19cd2-30fa-4815-8711-8b98afec3a82
 # ╠═18c93e20-2fe3-473f-a206-9b7abf45d6b5
@@ -4037,7 +4173,7 @@ version = "3.5.0+0"
 # ╠═3415f824-105c-472f-9003-e3921b0f58aa
 # ╟─a965d55f-f21c-4cab-af43-1ce8bb14b28a
 # ╟─0c18e387-e5a0-44a0-b0ea-26c9ad637479
-# ╠═4fee47cb-4702-4dbb-92ae-e928032cfb2c
+# ╟─4fee47cb-4702-4dbb-92ae-e928032cfb2c
 # ╟─9fdd78bb-d736-47d2-91cd-9672aed9274c
 # ╟─9971cc69-fbe7-45da-835f-6dd7eb129d8e
 # ╟─b7b9c533-b3b8-482e-a615-9be2fee76cbd
@@ -4068,14 +4204,16 @@ version = "3.5.0+0"
 # ╟─61ade99e-6292-4cd0-846a-5dc428bcb50d
 # ╟─6c02cfa7-19ec-4e8b-9cfd-54d71a400f31
 # ╠═718fac88-8216-4be6-af8e-1977f04daa7a
-# ╠═76075f68-de8d-4d2f-b201-93037095e978
+# ╟─76075f68-de8d-4d2f-b201-93037095e978
 # ╟─663d60fc-8bcd-4284-baa6-f5ab50c71bbf
 # ╠═db6f88af-38ea-4486-87d4-ae0e0580b95a
 # ╠═eff780a2-d21d-4cf1-92c9-a478857c04ae
-# ╠═7e562b08-bcb3-4f01-8cea-6f5a799b7e7e
-# ╠═c965104f-bcce-4222-b169-a779e266ec22
-# ╠═b7e7bb1e-b73d-4b9e-b7e6-4763f1d4bbbb
+# ╟─7e562b08-bcb3-4f01-8cea-6f5a799b7e7e
+# ╟─c965104f-bcce-4222-b169-a779e266ec22
+# ╟─b7e7bb1e-b73d-4b9e-b7e6-4763f1d4bbbb
 # ╟─0e9f4e15-5550-439e-b964-2b84aade660f
+# ╟─ab2a2d89-697f-4602-80f3-b8b8f9dca037
+# ╠═a88c87c3-9277-41fe-9208-d4af8496d51e
 # ╟─a6694cc3-e587-45ff-a8e2-c0ab946df074
 # ╟─0bb0df31-745f-4cc0-b278-d4d0f02b17a0
 # ╟─19384e46-529f-46af-bc96-bdf8b829bc8e
