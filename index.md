@@ -11,4 +11,4 @@ Welcome to my personal homepage!
 At GAMM 2022 I hold a talk with title “A Derivative-Free Trust Region Algorithm with Filter for Nonlinear Constraints in Multiobjective Optimization”.
 Here are some additional materials:
 
-* [Pluto Notebook](./myassets/example_notebook.jl)
+* [Download Pluto Notebook](./myassets/example_notebook.jl)
